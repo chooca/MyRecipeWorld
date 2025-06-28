@@ -1,0 +1,776 @@
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// server/index.ts
+import express3 from "express";
+
+// server/routes.ts
+import express from "express";
+import { createServer } from "http";
+
+// shared/schema.ts
+var schema_exports = {};
+__export(schema_exports, {
+  cookingHistory: () => cookingHistory,
+  cookingHistoryRelations: () => cookingHistoryRelations,
+  favorites: () => favorites,
+  favoritesRelations: () => favoritesRelations,
+  insertCookingHistorySchema: () => insertCookingHistorySchema,
+  insertFavoriteSchema: () => insertFavoriteSchema,
+  insertRecipeSchema: () => insertRecipeSchema,
+  recipes: () => recipes,
+  recipesRelations: () => recipesRelations,
+  sessions: () => sessions,
+  users: () => users,
+  usersRelations: () => usersRelations
+});
+import {
+  pgTable,
+  text,
+  varchar,
+  timestamp,
+  jsonb,
+  index,
+  serial,
+  integer,
+  boolean
+} from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { relations } from "drizzle-orm";
+var sessions = pgTable(
+  "sessions",
+  {
+    sid: varchar("sid").primaryKey(),
+    sess: jsonb("sess").notNull(),
+    expire: timestamp("expire").notNull()
+  },
+  (table) => [index("IDX_session_expire").on(table.expire)]
+);
+var users = pgTable("users", {
+  id: varchar("id").primaryKey().notNull(),
+  email: varchar("email").unique(),
+  firstName: varchar("first_name"),
+  lastName: varchar("last_name"),
+  profileImageUrl: varchar("profile_image_url"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow()
+});
+var recipes = pgTable("recipes", {
+  id: serial("id").primaryKey(),
+  userId: varchar("user_id").notNull().references(() => users.id),
+  title: text("title").notNull(),
+  description: text("description"),
+  imageUrl: text("image_url"),
+  prepTime: integer("prep_time"),
+  // in minutes
+  cookTime: integer("cook_time"),
+  // in minutes
+  servings: integer("servings"),
+  difficulty: varchar("difficulty", { enum: ["Easy", "Medium", "Hard"] }),
+  category: text("category"),
+  ingredients: jsonb("ingredients").$type().notNull(),
+  instructions: jsonb("instructions").$type().notNull(),
+  tags: jsonb("tags").$type().default([]),
+  isPublic: boolean("is_public").default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow()
+});
+var cookingHistory = pgTable("cooking_history", {
+  id: serial("id").primaryKey(),
+  userId: varchar("user_id").notNull().references(() => users.id),
+  recipeId: integer("recipe_id").notNull().references(() => recipes.id),
+  cookedAt: timestamp("cooked_at").defaultNow(),
+  notes: text("notes")
+});
+var favorites = pgTable("favorites", {
+  id: serial("id").primaryKey(),
+  userId: varchar("user_id").notNull().references(() => users.id),
+  recipeId: integer("recipe_id").notNull().references(() => recipes.id),
+  createdAt: timestamp("created_at").defaultNow()
+});
+var usersRelations = relations(users, ({ many }) => ({
+  recipes: many(recipes),
+  cookingHistory: many(cookingHistory),
+  favorites: many(favorites)
+}));
+var recipesRelations = relations(recipes, ({ one, many }) => ({
+  user: one(users, {
+    fields: [recipes.userId],
+    references: [users.id]
+  }),
+  cookingHistory: many(cookingHistory),
+  favorites: many(favorites)
+}));
+var cookingHistoryRelations = relations(cookingHistory, ({ one }) => ({
+  user: one(users, {
+    fields: [cookingHistory.userId],
+    references: [users.id]
+  }),
+  recipe: one(recipes, {
+    fields: [cookingHistory.recipeId],
+    references: [recipes.id]
+  })
+}));
+var favoritesRelations = relations(favorites, ({ one }) => ({
+  user: one(users, {
+    fields: [favorites.userId],
+    references: [users.id]
+  }),
+  recipe: one(recipes, {
+    fields: [favorites.recipeId],
+    references: [recipes.id]
+  })
+}));
+var insertRecipeSchema = createInsertSchema(recipes).omit({
+  id: true,
+  userId: true,
+  createdAt: true,
+  updatedAt: true
+});
+var insertCookingHistorySchema = createInsertSchema(cookingHistory).omit({
+  id: true,
+  userId: true,
+  cookedAt: true
+});
+var insertFavoriteSchema = createInsertSchema(favorites).omit({
+  id: true,
+  userId: true,
+  createdAt: true
+});
+
+// server/db.ts
+import { Pool, neonConfig } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-serverless";
+import ws from "ws";
+neonConfig.webSocketConstructor = ws;
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL must be set. Did you forget to provision a database?"
+  );
+}
+var pool = new Pool({ connectionString: process.env.DATABASE_URL });
+var db = drizzle({ client: pool, schema: schema_exports });
+
+// server/storage.ts
+import { eq, desc, and, or, like } from "drizzle-orm";
+var DatabaseStorage = class {
+  // User operations
+  async getUser(id) {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+  async upsertUser(userData) {
+    const [user] = await db.insert(users).values(userData).onConflictDoUpdate({
+      target: users.id,
+      set: {
+        ...userData,
+        updatedAt: /* @__PURE__ */ new Date()
+      }
+    }).returning();
+    return user;
+  }
+  // Recipe operations
+  async getRecipe(id) {
+    const [recipe] = await db.select().from(recipes).where(eq(recipes.id, id));
+    return recipe;
+  }
+  async getRecipesByUser(userId) {
+    return await db.select().from(recipes).where(eq(recipes.userId, userId)).orderBy(desc(recipes.updatedAt));
+  }
+  async getPublicRecipes() {
+    return await db.select().from(recipes).where(eq(recipes.isPublic, true)).orderBy(desc(recipes.createdAt));
+  }
+  async searchRecipes(query, userId) {
+    const searchCondition = or(
+      like(recipes.title, `%${query}%`),
+      like(recipes.description, `%${query}%`),
+      like(recipes.category, `%${query}%`)
+    );
+    const conditions = userId ? and(
+      searchCondition,
+      or(
+        eq(recipes.userId, userId),
+        eq(recipes.isPublic, true)
+      )
+    ) : and(searchCondition, eq(recipes.isPublic, true));
+    return await db.select().from(recipes).where(conditions).orderBy(desc(recipes.updatedAt));
+  }
+  async createRecipe(userId, recipe) {
+    const [newRecipe] = await db.insert(recipes).values({
+      ...recipe,
+      userId,
+      ingredients: recipe.ingredients || [],
+      instructions: recipe.instructions || [],
+      tags: recipe.tags || []
+    }).returning();
+    return newRecipe;
+  }
+  async updateRecipe(id, userId, recipe) {
+    const updateData = { ...recipe, updatedAt: /* @__PURE__ */ new Date() };
+    if (updateData.ingredients) {
+      updateData.ingredients = Array.isArray(updateData.ingredients) ? updateData.ingredients : Array.from(updateData.ingredients);
+    }
+    if (updateData.instructions) {
+      updateData.instructions = Array.isArray(updateData.instructions) ? updateData.instructions : Array.from(updateData.instructions);
+    }
+    if (updateData.tags) {
+      updateData.tags = Array.isArray(updateData.tags) ? updateData.tags : Array.from(updateData.tags);
+    }
+    const [updatedRecipe] = await db.update(recipes).set(updateData).where(and(eq(recipes.id, id), eq(recipes.userId, userId))).returning();
+    return updatedRecipe;
+  }
+  async deleteRecipe(id, userId) {
+    const result = await db.delete(recipes).where(and(eq(recipes.id, id), eq(recipes.userId, userId)));
+    return (result.rowCount || 0) > 0;
+  }
+  // Cooking history operations
+  async getCookingHistory(userId) {
+    return await db.select().from(cookingHistory).where(eq(cookingHistory.userId, userId)).orderBy(desc(cookingHistory.cookedAt));
+  }
+  async addCookingHistory(userId, history) {
+    const [newHistory] = await db.insert(cookingHistory).values({ ...history, userId }).returning();
+    return newHistory;
+  }
+  // Favorites operations
+  async getFavorites(userId) {
+    return await db.select({
+      id: recipes.id,
+      userId: recipes.userId,
+      title: recipes.title,
+      description: recipes.description,
+      imageUrl: recipes.imageUrl,
+      prepTime: recipes.prepTime,
+      cookTime: recipes.cookTime,
+      servings: recipes.servings,
+      difficulty: recipes.difficulty,
+      category: recipes.category,
+      ingredients: recipes.ingredients,
+      instructions: recipes.instructions,
+      tags: recipes.tags,
+      isPublic: recipes.isPublic,
+      createdAt: recipes.createdAt,
+      updatedAt: recipes.updatedAt
+    }).from(favorites).innerJoin(recipes, eq(favorites.recipeId, recipes.id)).where(eq(favorites.userId, userId)).orderBy(desc(favorites.createdAt));
+  }
+  async addFavorite(userId, recipeId) {
+    const [favorite] = await db.insert(favorites).values({ userId, recipeId }).returning();
+    return favorite;
+  }
+  async removeFavorite(userId, recipeId) {
+    const result = await db.delete(favorites).where(and(eq(favorites.userId, userId), eq(favorites.recipeId, recipeId)));
+    return (result.rowCount || 0) > 0;
+  }
+  async isFavorite(userId, recipeId) {
+    const [favorite] = await db.select().from(favorites).where(and(eq(favorites.userId, userId), eq(favorites.recipeId, recipeId)));
+    return !!favorite;
+  }
+};
+var storage = new DatabaseStorage();
+
+// server/replitAuth.ts
+import * as client from "openid-client";
+import { Strategy } from "openid-client/passport";
+import passport from "passport";
+import session from "express-session";
+import memoize from "memoizee";
+import connectPg from "connect-pg-simple";
+if (!process.env.REPLIT_DOMAINS) {
+  throw new Error("Environment variable REPLIT_DOMAINS not provided");
+}
+var getOidcConfig = memoize(
+  async () => {
+    return await client.discovery(
+      new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
+      process.env.REPL_ID
+    );
+  },
+  { maxAge: 3600 * 1e3 }
+);
+function getSession() {
+  const sessionTtl = 7 * 24 * 60 * 60 * 1e3;
+  const pgStore = connectPg(session);
+  const sessionStore = new pgStore({
+    conString: process.env.DATABASE_URL,
+    createTableIfMissing: false,
+    ttl: sessionTtl,
+    tableName: "sessions"
+  });
+  return session({
+    secret: process.env.SESSION_SECRET,
+    store: sessionStore,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: true,
+      maxAge: sessionTtl
+    }
+  });
+}
+function updateUserSession(user, tokens) {
+  user.claims = tokens.claims();
+  user.access_token = tokens.access_token;
+  user.refresh_token = tokens.refresh_token;
+  user.expires_at = user.claims?.exp;
+}
+async function upsertUser(claims) {
+  await storage.upsertUser({
+    id: claims["sub"],
+    email: claims["email"],
+    firstName: claims["first_name"],
+    lastName: claims["last_name"],
+    profileImageUrl: claims["profile_image_url"]
+  });
+}
+async function setupAuth(app2) {
+  app2.set("trust proxy", 1);
+  app2.use(getSession());
+  app2.use(passport.initialize());
+  app2.use(passport.session());
+  const config = await getOidcConfig();
+  const verify = async (tokens, verified) => {
+    const user = {};
+    updateUserSession(user, tokens);
+    await upsertUser(tokens.claims());
+    verified(null, user);
+  };
+  for (const domain of process.env.REPLIT_DOMAINS.split(",")) {
+    const strategy = new Strategy(
+      {
+        name: `replitauth:${domain}`,
+        config,
+        scope: "openid email profile offline_access",
+        callbackURL: `https://${domain}/api/callback`
+      },
+      verify
+    );
+    passport.use(strategy);
+  }
+  passport.serializeUser((user, cb) => cb(null, user));
+  passport.deserializeUser((user, cb) => cb(null, user));
+  app2.get("/api/login", (req, res, next) => {
+    passport.authenticate(`replitauth:${req.hostname}`, {
+      prompt: "login consent",
+      scope: ["openid", "email", "profile", "offline_access"]
+    })(req, res, next);
+  });
+  app2.get("/api/callback", (req, res, next) => {
+    passport.authenticate(`replitauth:${req.hostname}`, {
+      successReturnToOrRedirect: "/",
+      failureRedirect: "/api/login"
+    })(req, res, next);
+  });
+  app2.get("/api/logout", (req, res) => {
+    req.logout(() => {
+      res.redirect(
+        client.buildEndSessionUrl(config, {
+          client_id: process.env.REPL_ID,
+          post_logout_redirect_uri: `${req.protocol}://${req.hostname}`
+        }).href
+      );
+    });
+  });
+}
+var isAuthenticated = async (req, res, next) => {
+  const user = req.user;
+  if (!req.isAuthenticated() || !user.expires_at) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+  const now = Math.floor(Date.now() / 1e3);
+  if (now <= user.expires_at) {
+    return next();
+  }
+  const refreshToken = user.refresh_token;
+  if (!refreshToken) {
+    res.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+  try {
+    const config = await getOidcConfig();
+    const tokenResponse = await client.refreshTokenGrant(config, refreshToken);
+    updateUserSession(user, tokenResponse);
+    return next();
+  } catch (error) {
+    res.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+};
+
+// server/routes.ts
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+var uploadDir = path.join(process.cwd(), "uploads");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+var upload = multer({
+  dest: uploadDir,
+  limits: {
+    fileSize: 10 * 1024 * 1024
+    // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("image/")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image files are allowed"));
+    }
+  }
+});
+async function registerRoutes(app2) {
+  await setupAuth(app2);
+  app2.use("/uploads", express.static(uploadDir));
+  app2.get("/api/auth/user", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      res.json(user);
+    } catch (error) {
+      console.error("Error fetching user:", error);
+      res.status(500).json({ message: "Failed to fetch user" });
+    }
+  });
+  app2.get("/api/recipes", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const recipes2 = await storage.getRecipesByUser(userId);
+      res.json(recipes2);
+    } catch (error) {
+      console.error("Error fetching recipes:", error);
+      res.status(500).json({ message: "Failed to fetch recipes" });
+    }
+  });
+  app2.get("/api/recipes/public", async (req, res) => {
+    try {
+      const recipes2 = await storage.getPublicRecipes();
+      res.json(recipes2);
+    } catch (error) {
+      console.error("Error fetching public recipes:", error);
+      res.status(500).json({ message: "Failed to fetch public recipes" });
+    }
+  });
+  app2.get("/api/recipes/search", async (req, res) => {
+    try {
+      const { q } = req.query;
+      if (!q || typeof q !== "string") {
+        return res.status(400).json({ message: "Search query is required" });
+      }
+      const userId = req.user?.claims?.sub;
+      const recipes2 = await storage.searchRecipes(q, userId);
+      res.json(recipes2);
+    } catch (error) {
+      console.error("Error searching recipes:", error);
+      res.status(500).json({ message: "Failed to search recipes" });
+    }
+  });
+  app2.get("/api/recipes/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid recipe ID" });
+      }
+      const recipe = await storage.getRecipe(id);
+      if (!recipe) {
+        return res.status(404).json({ message: "Recipe not found" });
+      }
+      res.json(recipe);
+    } catch (error) {
+      console.error("Error fetching recipe:", error);
+      res.status(500).json({ message: "Failed to fetch recipe" });
+    }
+  });
+  app2.post("/api/recipes", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertRecipeSchema.parse(req.body);
+      const recipe = await storage.createRecipe(userId, validatedData);
+      res.status(201).json(recipe);
+    } catch (error) {
+      console.error("Error creating recipe:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ message: "Invalid recipe data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to create recipe" });
+    }
+  });
+  app2.put("/api/recipes/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const userId = req.user.claims.sub;
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid recipe ID" });
+      }
+      const validatedData = insertRecipeSchema.partial().parse(req.body);
+      const recipe = await storage.updateRecipe(id, userId, validatedData);
+      if (!recipe) {
+        return res.status(404).json({ message: "Recipe not found or not authorized" });
+      }
+      res.json(recipe);
+    } catch (error) {
+      console.error("Error updating recipe:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ message: "Invalid recipe data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update recipe" });
+    }
+  });
+  app2.delete("/api/recipes/:id", isAuthenticated, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const userId = req.user.claims.sub;
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid recipe ID" });
+      }
+      const success = await storage.deleteRecipe(id, userId);
+      if (!success) {
+        return res.status(404).json({ message: "Recipe not found or not authorized" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error deleting recipe:", error);
+      res.status(500).json({ message: "Failed to delete recipe" });
+    }
+  });
+  app2.post("/api/upload", isAuthenticated, upload.single("image"), (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No image file provided" });
+      }
+      const imageUrl = `/uploads/${req.file.filename}`;
+      res.json({ imageUrl });
+    } catch (error) {
+      console.error("Error uploading image:", error);
+      res.status(500).json({ message: "Failed to upload image" });
+    }
+  });
+  app2.get("/api/favorites", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const favorites2 = await storage.getFavorites(userId);
+      res.json(favorites2);
+    } catch (error) {
+      console.error("Error fetching favorites:", error);
+      res.status(500).json({ message: "Failed to fetch favorites" });
+    }
+  });
+  app2.post("/api/favorites/:recipeId", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const recipeId = parseInt(req.params.recipeId);
+      if (isNaN(recipeId)) {
+        return res.status(400).json({ message: "Invalid recipe ID" });
+      }
+      const favorite = await storage.addFavorite(userId, recipeId);
+      res.status(201).json(favorite);
+    } catch (error) {
+      console.error("Error adding favorite:", error);
+      res.status(500).json({ message: "Failed to add favorite" });
+    }
+  });
+  app2.delete("/api/favorites/:recipeId", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const recipeId = parseInt(req.params.recipeId);
+      if (isNaN(recipeId)) {
+        return res.status(400).json({ message: "Invalid recipe ID" });
+      }
+      const success = await storage.removeFavorite(userId, recipeId);
+      if (!success) {
+        return res.status(404).json({ message: "Favorite not found" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error removing favorite:", error);
+      res.status(500).json({ message: "Failed to remove favorite" });
+    }
+  });
+  app2.get("/api/cooking-history", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const history = await storage.getCookingHistory(userId);
+      res.json(history);
+    } catch (error) {
+      console.error("Error fetching cooking history:", error);
+      res.status(500).json({ message: "Failed to fetch cooking history" });
+    }
+  });
+  app2.post("/api/cooking-history", isAuthenticated, async (req, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertCookingHistorySchema.parse(req.body);
+      const history = await storage.addCookingHistory(userId, validatedData);
+      res.status(201).json(history);
+    } catch (error) {
+      console.error("Error adding cooking history:", error);
+      if (error.name === "ZodError") {
+        return res.status(400).json({ message: "Invalid history data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to add cooking history" });
+    }
+  });
+  const httpServer = createServer(app2);
+  return httpServer;
+}
+
+// server/vite.ts
+import express2 from "express";
+import fs2 from "fs";
+import path3 from "path";
+import { createServer as createViteServer, createLogger } from "vite";
+
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path2 from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+var vite_config_default = defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    ...process.env.NODE_ENV !== "production" && process.env.REPL_ID !== void 0 ? [
+      await import("@replit/vite-plugin-cartographer").then(
+        (m) => m.cartographer()
+      )
+    ] : []
+  ],
+  resolve: {
+    alias: {
+      "@": path2.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path2.resolve(import.meta.dirname, "shared"),
+      "@assets": path2.resolve(import.meta.dirname, "attached_assets")
+    }
+  },
+  root: path2.resolve(import.meta.dirname, "client"),
+  build: {
+    outDir: path2.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true
+  },
+  server: {
+    fs: {
+      strict: true,
+      deny: ["**/.*"]
+    }
+  }
+});
+
+// server/vite.ts
+import { nanoid } from "nanoid";
+var viteLogger = createLogger();
+function log(message, source = "express") {
+  const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  });
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+async function setupVite(app2, server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true
+  };
+  const vite = await createViteServer({
+    ...vite_config_default,
+    configFile: false,
+    customLogger: {
+      ...viteLogger,
+      error: (msg, options) => {
+        viteLogger.error(msg, options);
+        process.exit(1);
+      }
+    },
+    server: serverOptions,
+    appType: "custom"
+  });
+  app2.use(vite.middlewares);
+  app2.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+    try {
+      const clientTemplate = path3.resolve(
+        import.meta.dirname,
+        "..",
+        "client",
+        "index.html"
+      );
+      let template = await fs2.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e);
+      next(e);
+    }
+  });
+}
+function serveStatic(app2) {
+  const distPath = path3.resolve(import.meta.dirname, "public");
+  if (!fs2.existsSync(distPath)) {
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+  app2.use(express2.static(distPath));
+  app2.use("*", (_req, res) => {
+    res.sendFile(path3.resolve(distPath, "index.html"));
+  });
+}
+
+// server/index.ts
+var app = express3();
+app.use(express3.json());
+app.use(express3.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path4 = req.path;
+  let capturedJsonResponse = void 0;
+  const originalResJson = res.json;
+  res.json = function(bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path4.startsWith("/api")) {
+      let logLine = `${req.method} ${path4} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "\u2026";
+      }
+      log(logLine);
+    }
+  });
+  next();
+});
+(async () => {
+  const server = await registerRoutes(app);
+  app.use((err, _req, res, _next) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+    res.status(status).json({ message });
+    throw err;
+  });
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+  const port = 5e3;
+  server.listen({
+    port,
+    host: "0.0.0.0",
+    reusePort: true
+  }, () => {
+    log(`serving on port ${port}`);
+  });
+})();
